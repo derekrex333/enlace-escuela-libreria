@@ -1,0 +1,246 @@
+-----PRIMERA SECCION (SCRIP INICIAL)-------------------------------------------------------
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+DROP TABLE IF EXISTS detalle_vale    CASCADE;
+DROP TABLE IF EXISTS vales           CASCADE;
+DROP TABLE IF EXISTS pedidos         CASCADE;
+DROP TABLE IF EXISTS detalle_pedido  CASCADE;
+DROP TABLE IF EXISTS libros          CASCADE;
+DROP TABLE IF EXISTS escuelas        CASCADE;
+DROP TABLE IF EXISTS usuarios        CASCADE;
+DROP TABLE IF EXISTS roles           CASCADE;
+
+CREATE TABLE roles (
+    id_rol   SERIAL      PRIMARY KEY,
+    nombre   VARCHAR(30) NOT NULL UNIQUE,
+    clave    VARCHAR(30) NOT NULL UNIQUE
+);
+
+INSERT INTO roles (nombre, clave) VALUES
+    ('Proveedor',  'p'),
+    ('Escuela',    'e'),
+    ('Estudiante', 'es');
+
+CREATE TABLE usuarios (
+    id_usuario  SERIAL       PRIMARY KEY,
+    nombre      VARCHAR(100) NOT NULL,
+    correo      VARCHAR(150) NOT NULL UNIQUE,
+    contrasena  TEXT         NOT NULL,
+    id_rol      INT          NOT NULL REFERENCES roles(id_rol) ON DELETE RESTRICT,
+    activo      BOOLEAN      NOT NULL DEFAULT TRUE,
+    creado_en   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_usuarios_correo ON usuarios(correo);
+CREATE INDEX idx_usuarios_rol    ON usuarios(id_rol);
+
+CREATE TABLE escuelas (
+    id_escuela  INT          PRIMARY KEY,
+    nombre      VARCHAR(200) NOT NULL,
+    ubicacion   VARCHAR(300),
+    telefono    BIGINT,
+    correo      VARCHAR(150),
+    activa      BOOLEAN      NOT NULL DEFAULT TRUE,
+    creado_en   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_escuelas_nombre ON escuelas(nombre);
+
+CREATE TABLE libros (
+    isbn        BIGINT          PRIMARY KEY,
+    titulo      VARCHAR(300)    NOT NULL,
+    autor       VARCHAR(200)    NOT NULL,
+    editorial   VARCHAR(200),
+    categoria   VARCHAR(100),
+    materia     VARCHAR(100),
+    precio      NUMERIC(10, 2)  NOT NULL DEFAULT 0.00,
+    cantidad    INT             NOT NULL DEFAULT 0 CHECK (cantidad >= 0),
+    imagen_url  TEXT,
+    disponible  BOOLEAN         NOT NULL DEFAULT TRUE,
+    creado_en   TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    actualizado TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_libros_titulo    ON libros(titulo);
+CREATE INDEX idx_libros_autor     ON libros(autor);
+CREATE INDEX idx_libros_categoria ON libros(categoria);
+
+CREATE TABLE vales (
+    id_vale     SERIAL       PRIMARY KEY,
+    id_escuela  INT          NOT NULL REFERENCES escuelas(id_escuela) ON DELETE RESTRICT,
+    correo      VARCHAR(150),
+    fecha       DATE         NOT NULL DEFAULT CURRENT_DATE,
+    estado      VARCHAR(30)  NOT NULL DEFAULT 'pendiente'
+                             CHECK (estado IN ('pendiente','aprobado','rechazado','entregado')),
+    creado_en   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_vales_escuela ON vales(id_escuela);
+CREATE INDEX idx_vales_estado  ON vales(estado);
+CREATE INDEX idx_vales_fecha   ON vales(fecha);
+
+CREATE TABLE detalle_vale (
+    id_detalle  SERIAL  PRIMARY KEY,
+    id_vale     INT     NOT NULL REFERENCES vales(id_vale)   ON DELETE CASCADE,
+    isbn        BIGINT  NOT NULL REFERENCES libros(isbn)     ON DELETE RESTRICT,
+    cantidad    INT     NOT NULL CHECK (cantidad > 0),
+    precio_unit NUMERIC(10, 2) NOT NULL DEFAULT 0.00
+);
+
+CREATE INDEX idx_detalle_vale_vale ON detalle_vale(id_vale);
+CREATE INDEX idx_detalle_vale_isbn ON detalle_vale(isbn);
+
+CREATE TABLE pedidos (
+    id_pedido       SERIAL      PRIMARY KEY,
+    id_solicitante  INT         NOT NULL REFERENCES usuarios(id_usuario) ON DELETE RESTRICT,
+    id_escuela      INT         REFERENCES escuelas(id_escuela),
+    tipo            VARCHAR(20) NOT NULL
+                                CHECK (tipo IN ('escuela_a_proveedor','estudiante_a_escuela')),
+    estado          VARCHAR(30) NOT NULL DEFAULT 'pendiente'
+                                CHECK (estado IN ('pendiente','aprobado','rechazado','entregado')),
+    fecha           DATE        NOT NULL DEFAULT CURRENT_DATE,
+    creado_en       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE detalle_pedido (
+    id_detalle  SERIAL  PRIMARY KEY,
+    id_pedido   INT     NOT NULL REFERENCES pedidos(id_pedido) ON DELETE CASCADE,
+    isbn        BIGINT  NOT NULL REFERENCES libros(isbn)       ON DELETE RESTRICT,
+    cantidad    INT     NOT NULL CHECK (cantidad > 0)
+);
+
+CREATE OR REPLACE FUNCTION actualizar_timestamp()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.actualizado = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_libros_actualizado
+BEFORE UPDATE ON libros
+FOR EACH ROW EXECUTE FUNCTION actualizar_timestamp();
+
+CREATE OR REPLACE FUNCTION reducir_stock_vale()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE libros SET cantidad = cantidad - NEW.cantidad WHERE isbn = NEW.isbn;
+    IF (SELECT cantidad FROM libros WHERE isbn = NEW.isbn) < 0 THEN
+        RAISE EXCEPTION 'Stock insuficiente para ISBN %', NEW.isbn;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_reducir_stock_vale
+AFTER INSERT ON detalle_vale
+FOR EACH ROW EXECUTE FUNCTION reducir_stock_vale();
+
+CREATE OR REPLACE FUNCTION restaurar_stock_vale()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE libros SET cantidad = cantidad + OLD.cantidad WHERE isbn = OLD.isbn;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_restaurar_stock_vale
+AFTER DELETE ON detalle_vale
+FOR EACH ROW EXECUTE FUNCTION restaurar_stock_vale();
+
+CREATE OR REPLACE VIEW v_libros_disponibles AS
+SELECT isbn, titulo, autor, editorial, categoria, materia, precio, cantidad, imagen_url
+FROM libros WHERE cantidad > 0 AND disponible = TRUE ORDER BY titulo;
+
+CREATE OR REPLACE VIEW v_vales_pendientes AS
+SELECT v.id_vale, e.nombre AS escuela, v.correo, v.fecha, v.estado,
+    COUNT(d.id_detalle) AS total_titulos,
+    SUM(d.cantidad) AS total_libros,
+    SUM(d.cantidad * d.precio_unit) AS total_monto
+FROM vales v
+JOIN escuelas e ON e.id_escuela = v.id_escuela
+LEFT JOIN detalle_vale d ON d.id_vale = v.id_vale
+WHERE v.estado = 'pendiente'
+GROUP BY v.id_vale, e.nombre, v.correo, v.fecha, v.estado
+ORDER BY v.fecha DESC;
+
+CREATE OR REPLACE VIEW v_reporte_semanal AS
+SELECT v.id_vale, e.nombre AS escuela, v.fecha, v.estado,
+    l.titulo, l.autor, d.cantidad, d.precio_unit,
+    (d.cantidad * d.precio_unit) AS subtotal
+FROM vales v
+JOIN escuelas e     ON e.id_escuela = v.id_escuela
+JOIN detalle_vale d ON d.id_vale    = v.id_vale
+JOIN libros l       ON l.isbn       = d.isbn
+WHERE v.fecha >= CURRENT_DATE - INTERVAL '7 days'
+ORDER BY v.fecha DESC, v.id_vale;
+
+CREATE OR REPLACE VIEW v_resumen_general AS
+SELECT
+    (SELECT COUNT(*) FROM libros WHERE disponible = TRUE)            AS total_libros,
+    (SELECT SUM(cantidad) FROM libros WHERE disponible = TRUE)       AS total_ejemplares,
+    (SELECT COUNT(*) FROM escuelas WHERE activa = TRUE)              AS total_escuelas,
+    (SELECT COUNT(*) FROM vales WHERE estado = 'pendiente')          AS vales_pendientes,
+    (SELECT COUNT(*) FROM vales WHERE estado = 'entregado'
+     AND fecha >= CURRENT_DATE - INTERVAL '7 days')                 AS vales_entregados_semana,
+    (SELECT COALESCE(SUM(d.cantidad * d.precio_unit), 0)
+     FROM detalle_vale d JOIN vales v ON v.id_vale = d.id_vale
+     WHERE v.fecha >= CURRENT_DATE - INTERVAL '7 days')             AS monto_semanal;
+
+CREATE OR REPLACE FUNCTION autenticar_usuario(p_correo TEXT, p_contrasena TEXT)
+RETURNS TABLE (id_usuario INT, nombre TEXT, rol VARCHAR)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+    SELECT u.id_usuario, u.nombre, r.clave
+    FROM usuarios u
+    JOIN roles r ON r.id_rol = u.id_rol
+    WHERE u.correo = p_correo
+      AND u.contrasena = crypt(p_contrasena, u.contrasena)
+      AND u.activo = TRUE
+    LIMIT 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION siguiente_id_vale()
+RETURNS INT LANGUAGE sql AS $$
+    SELECT COALESCE(MAX(id_vale), 0) + 1 FROM vales;
+$$;
+
+INSERT INTO escuelas (id_escuela, nombre, ubicacion, telefono, correo) VALUES
+    (1, 'Escuela Primaria Benito Juarez',       'Av. Reforma 100, CDMX',       5512345678, 'benito@escuela.mx'),
+    (2, 'Secundaria Tecnica No. 12',            'Calle Hidalgo 45, Puebla',    2221234567, 'sec12@edu.mx'),
+    (3, 'Preparatoria Federal Por Cooperacion', 'Blvd. Norte 8, Monterrey',    8181234567, 'prepafed@edu.mx');
+
+INSERT INTO usuarios (nombre, correo, contrasena, id_rol) VALUES
+    ('Carlos Proveedor', 'proveedor@libreria.mx', crypt('admin123',    gen_salt('bf')), 1),
+    ('Maria Escuela',    'escuela@edu.mx',         crypt('escuela123', gen_salt('bf')), 2),
+    ('Juan Estudiante',  'juan@alumno.mx',          crypt('alumno123',  gen_salt('bf')), 3);
+
+INSERT INTO libros (isbn, titulo, autor, editorial, categoria, materia, precio, cantidad, imagen_url) VALUES
+    (9780743273565, 'El Gran Gatsby',           'F. Scott Fitzgerald',    'Scribner',     'Novela',        'Literatura',   180.00, 25, 'https://covers.openlibrary.org/b/isbn/9780743273565-L.jpg'),
+    (9780062316097, 'El Alquimista',            'Paulo Coelho',           'HarperCollins','Ficcion',       'Literatura',   150.00, 40, 'https://covers.openlibrary.org/b/isbn/9780062316097-L.jpg'),
+    (9788408163978, 'Cien Anos de Soledad',     'Gabriel Garcia Marquez', 'Planeta',      'Novela',        'Literatura',   220.00, 18, 'https://covers.openlibrary.org/b/isbn/9788408163978-L.jpg'),
+    (9786070736438, 'Matematicas 1 Secundaria', 'Varios Autores',         'SEP',          'Texto Escolar', 'Matematicas',   95.00, 60, 'https://covers.openlibrary.org/b/isbn/9786070736438-L.jpg'),
+    (9786070736445, 'Ciencias Naturales 2',     'Varios Autores',         'SEP',          'Texto Escolar', 'Ciencias',      95.00, 55, 'https://covers.openlibrary.org/b/isbn/9786070736445-L.jpg'),
+    (9786070736452, 'Historia de Mexico',       'Varios Autores',         'SEP',          'Texto Escolar', 'Historia',      95.00, 48, 'https://covers.openlibrary.org/b/isbn/9786070736452-L.jpg'),
+    (9780316769174, 'El Cazador Oculto',        'J.D. Salinger',          'Little Brown', 'Novela',        'Literatura',   160.00, 30, 'https://covers.openlibrary.org/b/isbn/9780316769174-L.jpg'),
+    (9786073155427, 'Quimica Organica',         'John McMurry',           'Cengage',      'Ciencia',       'Quimica',      480.00, 12, 'https://covers.openlibrary.org/b/isbn/9786073155427-L.jpg');
+
+INSERT INTO vales (id_escuela, correo, fecha, estado) VALUES
+    (1, 'benito@escuela.mx', CURRENT_DATE, 'pendiente');
+
+INSERT INTO detalle_vale (id_vale, isbn, cantidad, precio_unit) VALUES
+    (1, 9786070736438, 10, 95.00),
+    (1, 9786070736445,  8, 95.00);
+
+SELECT 'roles'        AS tabla, COUNT(*) AS registros FROM roles
+UNION ALL SELECT 'usuarios',    COUNT(*) FROM usuarios
+UNION ALL SELECT 'escuelas',    COUNT(*) FROM escuelas
+UNION ALL SELECT 'libros',      COUNT(*) FROM libros
+UNION ALL SELECT 'vales',       COUNT(*) FROM vales
+UNION ALL SELECT 'detalle_vale',COUNT(*) FROM detalle_vale;
+
+
+--SEGUNDA SECCION (MAS LIBROS)----------------------------------------------------------------
