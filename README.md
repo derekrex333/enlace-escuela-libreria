@@ -176,7 +176,3 @@ Puedes modificarla directamente en el constructor de `MainWindow`.
 - La carpeta `data/` se crea automáticamente al iniciar si no existe
 
 ---
-
-## 📄 Licencia
-
-Este proyecto fue desarrollado con fines académicos.
