@@ -3,7 +3,7 @@
 Sistema de gestión para librerías que distribuyen libros a escuelas. Permite registrar libros, escuelas y vales de pedido, con tres roles de acceso diferenciados, galería visual de libros con portadas y base de datos PostgreSQL.
 
 Desarrollado en **C++17** con **Qt6** y **libpq**.
-
+POR: A. Derek
 ---
 
 ## 📸 Capturas de pantalla
